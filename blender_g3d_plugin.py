@@ -2,7 +2,7 @@ bl_info = {
     "name": "G3D Mesh Import/Export",
     "description": "Import/Export .g3d file (Glest 3D)",
     "author": "various, updated for Blender 5.x by Bobo",
-    "version": (0, 12, 1),
+    "version": (0, 12, 2),
     "blender": (5, 1, 0),
     "location": "File > Import/Export > Glest 3D (.g3d)",
     "category": "Import-Export",
@@ -16,7 +16,7 @@ from mathutils import Matrix
 from math import radians
 
 ###########################################################################
-# --- Data Structures ---
+# --- Helpers & Data Structures ---
 ###########################################################################
 def unpack_list(list_of_tuples):
     l = []
@@ -50,6 +50,7 @@ class G3DMeshHeaderv4:
     def _readtexname(self, fileID):
         temp = fileID.read(struct.calcsize(self.texname_format))
         data = struct.unpack(self.texname_format, temp)
+        # decode and strip nulls
         return "".join([c.decode("ascii") for c in data if c != b'\x00'])
 
     def __init__(self, fileID):
@@ -98,17 +99,21 @@ class G3DMeshdataV4:
         self.normals = struct.unpack(normals_format, fileID.read(struct.calcsize(normals_format)))
         if header.hastexture:
             self.texturecoords = struct.unpack(texturecoords_format, fileID.read(struct.calcsize(texturecoords_format)))
+        else:
+            self.texturecoords = ()
         self.indices = struct.unpack(indices_format, fileID.read(struct.calcsize(indices_format)))
 
 ###########################################################################
-# --- Core Mesh Importer ---
+# --- Import Implementation (kept light & modern) ---
 ###########################################################################
-def createMesh(filename, header, data, toblender, operator):
+def createMesh_import(filename, header, data, toblender, operator):
+    # Basic import: create mesh with first (base) frame vertices and triangles
     mesh = bpy.data.meshes.new(header.meshname)
     meshobj = bpy.data.objects.new(header.meshname + "_Object", mesh)
     bpy.context.collection.objects.link(meshobj)
     bpy.context.view_layer.update()
 
+    # Build vertex list (use first frame)
     vertsCO = [(data.vertices[i], data.vertices[i+1], data.vertices[i+2])
                for i in range(0, header.vertexcount * 3, 3)]
     faces = [(data.indices[i], data.indices[i+1], data.indices[i+2])
@@ -122,38 +127,263 @@ def createMesh(filename, header, data, toblender, operator):
 
     mesh.update()
     mesh.validate(clean_customdata=True)
+    return meshobj
 
-###########################################################################
-# --- Import Logic ---
-###########################################################################
+
 def G3DLoader(filepath, toblender, operator):
     print(f"\nImporting: {filepath}")
-    fileID = open(filepath, "rb")
+    try:
+        fileID = open(filepath, "rb")
+    except Exception as e:
+        operator.report({'ERROR'}, f"Could not open file: {e}")
+        return {'CANCELLED'}
+
     header = G3DHeader(fileID)
 
-    if header.id != "G3D" or header.version != 4:
-        operator.report({'ERROR'}, "Unsupported or invalid G3D file")
+    if header.id != "G3D" or header.version not in (4,):
+        operator.report({'ERROR'}, "Unsupported or invalid G3D file (only v4 supported by this importer)")
+        fileID.close()
         return {'CANCELLED'}
 
     modelheader = G3DModelHeaderv4(fileID)
+    created = []
     for _ in range(modelheader.meshcount):
         meshheader = G3DMeshHeaderv4(fileID)
         meshdata = G3DMeshdataV4(fileID, meshheader)
-        createMesh(filepath, meshheader, meshdata, toblender, operator)
+        obj = createMesh_import(filepath, meshheader, meshdata, toblender, operator)
+        created.append(obj)
 
     fileID.close()
-    print("Import finished successfully!")
+    operator.report({'INFO'}, f"Imported {len(created)} mesh(es)")
     return {'FINISHED'}
 
 ###########################################################################
-# --- Blender UI / Operators ---
+# --- Export Implementation (full exporter) ---
 ###########################################################################
+def find_image_in_material(material):
+    # Try to find an image from a material (node-based or texture slots)
+    if material is None:
+        return None
+    # node-based
+    if material.use_nodes:
+        tree = material.node_tree
+        if tree:
+            # look for first Image Texture node with an image
+            for node in tree.nodes:
+                if node.type == 'TEX_IMAGE' and getattr(node, "image", None):
+                    return node.image
+    else:
+        # legacy: search texture slots
+        for slot in material.texture_paint_images:
+            if slot:
+                return slot
+        # fallback: try texture_slots
+        if hasattr(material, "texture_slots"):
+            for slot in material.texture_slots:
+                if slot and slot.texture and slot.texture.type == 'IMAGE' and slot.texture.image:
+                    return slot.texture.image
+    return None
+
+
+def G3DSaver(filepath, context, toglest, operator):
+    print(f"\nExporting: {filepath}")
+    depsgraph = context.evaluated_depsgraph_get()
+
+    objs = context.selected_objects
+    if len(objs) == 0:
+        objs = list(bpy.data.objects)
+
+    # count meshes
+    mesh_objs = [o for o in objs if o.type == 'MESH']
+    if not mesh_objs:
+        operator.report({'ERROR'}, "No mesh objects found to export")
+        return -1
+
+    try:
+        f = open(filepath, "wb")
+    except Exception as e:
+        operator.report({'ERROR'}, f"Unable to open file for writing: {e}")
+        return -1
+
+    # Header v4
+    f.write(struct.pack("<3cB", b'G', b'3', b'D', 4))
+    # model header: meshCount, type=0
+    f.write(struct.pack("<HB", len(mesh_objs), 0))
+
+    for obj in mesh_objs:
+        # Get evaluated mesh (with modifiers)
+        eval_obj = obj.evaluated_get(depsgraph)
+        me = eval_obj.to_mesh()
+        # ensure triangulated loop triangles are available
+        me.calc_loop_triangles()
+
+        # gather material/texture info from original object's first material
+        diffuseColor = (1.0, 1.0, 1.0)
+        specularColor = (0.9, 0.9, 0.9)
+        opacity = 1.0
+        textures_flag = 0
+        texnames = []
+
+        if obj.data.materials:
+            mat = obj.data.materials[0]
+            # try to find an image
+            img = find_image_in_material(mat)
+            if img and hasattr(img, "filepath"):
+                textures_flag |= 1  # diffuse present
+                texnames.append(os.path.basename(bpy.path.abspath(img.filepath)))
+                diffuseColor = mat.diffuse_color[:3] if hasattr(mat, "diffuse_color") else diffuseColor
+                specularColor = mat.specular_color[:3] if hasattr(mat, "specular_color") else specularColor
+                opacity = mat.alpha if hasattr(mat, "alpha") else opacity
+
+                # try to find additional images (spec/normal) from subsequent image nodes - best-effort
+                if mat.use_nodes and mat.node_tree:
+                    images = []
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and getattr(node, "image", None):
+                            images.append(node.image)
+                    # first was diffuse, append up to 2 more
+                    for im in images[1:3]:
+                        texnames.append(os.path.basename(bpy.path.abspath(im.filepath)))
+                        textures_flag |= 1 << (len(texnames)-1)
+        # Build mapping for unique (vertex, uv) pairs because G3D expects single uv per vertex
+        # We'll collect vertices, normals per-frame (only single frame here), and per-vertex UVs
+        # Use mesh.loops and loop_triangles to build indices
+        # uv per loop:
+        uv_layer = me.uv_layers.active.data if me.uv_layers.active else None
+
+        # mapping: (vertex_index, uv_u, uv_v) -> new_index
+        vmap = {}
+        vertices_list = []
+        normals_list = []
+        uvlist = []
+        indices = []
+
+        next_index = 0
+
+        # Build vertices and normals (single frame)
+        # But need to duplicate vertices when same vertex used with different UV
+        for tri in me.loop_triangles:
+            tri_verts = []
+            for li in tri.loops:
+                v_idx = me.loops[li].vertex_index
+                if uv_layer:
+                    uv = uv_layer[li].uv
+                    key = (v_idx, float(uv.x), float(uv.y))
+                else:
+                    key = (v_idx, None, None)
+
+                if key in vmap:
+                    new_idx = vmap[key]
+                else:
+                    # add new vertex
+                    co = me.vertices[v_idx].co
+                    no = me.vertices[v_idx].normal
+                    vertices_list.extend([co.x, co.y, co.z])
+                    normals_list.extend([no.x, no.y, no.z])
+                    if uv_layer:
+                        uvlist.extend([uv.x, uv.y])
+                    else:
+                        # placeholder
+                        uvlist.extend([0.0, 0.0])
+                    new_idx = next_index
+                    vmap[key] = new_idx
+                    next_index += 1
+                tri_verts.append(new_idx)
+            # ensure triangle orientation stays as is (we don't re-triangulate)
+            indices.extend(tri_verts)
+
+        indexCount = len(indices)
+        vertexCount = next_index
+        frameCount = 1  # this exporter exports a single frame (animation frames would require shapekeys handling)
+
+        # properties: bitflags
+        properties = 0
+        mat_data = obj.data
+        # custom props (added by addon UI) if present
+        if hasattr(mat_data, "g3d_customColor") and mat_data.g3d_customColor:
+            properties |= 1
+        if hasattr(mat_data, "show_double_sided") and mat_data.show_double_sided:
+            properties |= 2
+        if hasattr(mat_data, "g3d_noSelect") and mat_data.g3d_noSelect:
+            properties |= 4
+        if hasattr(mat_data, "g3d_glow") and mat_data.g3d_glow:
+            properties |= 8
+        # team color alpha if present
+        team_alpha = getattr(mat_data, "teamcolor_alpha", 0)
+        properties |= (255 - int(team_alpha)) << 24
+
+        textures = textures_flag
+
+        # Write MeshHeader (64s3I8f2I)
+        # meshname padded/truncated to 64 bytes
+        meshname_bytes = bytes(obj.name[:64], "ascii")
+        # struct.pack will pad/truncate automatically for <64s
+        f.write(struct.pack("<64s3I8f2I",
+            meshname_bytes,
+            frameCount, vertexCount, indexCount,
+            float(diffuseColor[0]), float(diffuseColor[1]), float(diffuseColor[2]),
+            float(specularColor[0]), float(specularColor[1]), float(specularColor[2]),
+            float(9.999999), float(opacity),
+            int(properties), int(textures)
+        ))
+
+        # Texture names (64s) for each set bit present (diffuse/spec/normal) in order
+        if textures:
+            for tn in texnames:
+                f.write(struct.pack("<64s", bytes(tn[:64], "ascii")))
+
+        # write vertices, normals, texcoords, indices
+        # vertex_format = "<%if" % int(frameCount * vertexCount * 3)
+        vertex_format = "<%if" % int(frameCount * vertexCount * 3)
+        normals_format = "<%if" % int(frameCount * vertexCount * 3)
+        texturecoords_format = "<%if" % int(vertexCount * 2)
+        indices_format = "<%iI" % int(indexCount)
+
+        # vertices_list and normals_list already flattened
+        if vertexCount > 0:
+            f.write(struct.pack(vertex_format, *vertices_list))
+            f.write(struct.pack(normals_format, *normals_list))
+            if textures:
+                f.write(struct.pack(texturecoords_format, *uvlist))
+            f.write(struct.pack(indices_format, *indices))
+
+        # free evaluated mesh
+        eval_obj.to_mesh_clear()
+    f.close()
+    operator.report({'INFO'}, f"Exported {len(mesh_objs)} mesh(es) to {os.path.basename(filepath)}")
+    return 0
+
+###########################################################################
+# --- Blender UI / Operators / Panel ---
+###########################################################################
+class G3DPanel(bpy.types.Panel):
+    bl_label = "G3D properties"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None and context.object.type == 'MESH')
+
+    def draw(self, context):
+        self.layout.prop(context.object.data, "g3d_customColor")
+        col = self.layout.column()
+        col.prop(context.object.data, "teamcolor_alpha")
+        col.enabled = context.object.data.g3d_customColor
+        self.layout.prop(context.object.data, "show_double_sided", text="double sided")
+        self.layout.prop(context.object.data, "g3d_noSelect")
+        self.layout.prop(context.object.data, "g3d_fullyOpaque")
+        self.layout.prop(context.object.data, "g3d_glow")
+
+
 class ImportG3D(bpy.types.Operator, ImportHelper):
+    '''Load a G3D file'''
     bl_idname = "import_scene.g3d"
     bl_label = "Import G3D"
     filename_ext = ".g3d"
     filter_glob: StringProperty(default="*.g3d", options={'HIDDEN'})
-    toblender: BoolProperty(name="Rotate to Blender Orientation", default=True)
+    toblender: BoolProperty(name="rotate to Blender orientation", default=True)
 
     def execute(self, context):
         try:
@@ -164,18 +394,112 @@ class ImportG3D(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
 
+class ExportG3D(bpy.types.Operator, ExportHelper):
+    '''Save a G3D file'''
+    bl_idname = "export_scene.g3d"
+    bl_label = "Export G3D"
+    filename_ext = ".g3d"
+    filter_glob: StringProperty(default="*.g3d", options={'HIDDEN'})
+
+    showg3d: BoolProperty(
+        name="show G3D afterwards",
+        description=("Run g3dviewer to show G3D after export. "
+                     "g3dviewer needs to be in the scripts directory, "
+                     "otherwise the associated program of .g3d is run."),
+        default=False)
+
+    toglest: BoolProperty(
+        name="rotate to glest orientation",
+        description="Rotate meshes from Blender to Glest orientation",
+        default=True)
+
+    def execute(self, context):
+        try:
+            res = G3DSaver(self.filepath, context, self.toglest, self)
+            if res == 0 and self.showg3d:
+                scriptsdir = bpy.utils.script_path_user()
+                dname = os.path.dirname(self.filepath)
+                found = False
+                if scriptsdir:
+                    for f in os.listdir(scriptsdir):
+                        if "g3dviewer" in f:
+                            fpath = os.path.join(scriptsdir, f)
+                            if os.path.isfile(fpath) and os.access(fpath, os.X_OK):
+                                subprocess.Popen([fpath, self.filepath], cwd=dname)
+                                found = True
+                                break
+                if not found:
+                    if os.name == 'posix':
+                        subprocess.Popen(['xdg-open', self.filepath], cwd=dname)
+                    elif os.name == 'mac':
+                        subprocess.Popen(['open', self.filepath], cwd=dname)
+                    elif os.name == 'nt':
+                        subprocess.Popen(['cmd', '/C', 'start', self.filepath], cwd=dname)
+        except Exception as e:
+            traceback.print_exc()
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 def menu_func_import(self, context):
     self.layout.operator(ImportG3D.bl_idname, text="Glest 3D Model (.g3d)")
 
 
+def menu_func_export(self, context):
+    self.layout.operator(ExportG3D.bl_idname, text="Glest 3D File (.g3d)")
+
+
+classes = (
+    G3DPanel,
+    ImportG3D,
+    ExportG3D,
+)
+
+
 def register():
-    bpy.utils.register_class(ImportG3D)
+    # custom mesh properties
+    bpy.types.Mesh.g3d_customColor = BoolProperty(
+        name="team color",
+        description="replace alpha channel of texture with team color",
+        default=False)
+    bpy.types.Mesh.g3d_noSelect = BoolProperty(
+        name="non-selectable",
+        description="click on mesh doesn't select unit",
+        default=False)
+    bpy.types.Mesh.g3d_fullyOpaque = BoolProperty(
+        name="fully opaque",
+        description="sets opacity to 1.0, ignoring what's set in materials",
+        default=False)
+    bpy.types.Mesh.g3d_glow = BoolProperty(
+        name="glow",
+        description="let objects glow like particles",
+        default=False)
+    bpy.types.Mesh.teamcolor_alpha = IntProperty(
+        name="team color alpha",
+        description="set the transparency of the teamcolor part of the texture only",
+        default=0, min=0, max=2**8 - 1)
+
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
-    bpy.utils.unregister_class(ImportG3D)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+    # remove custom properties
+    for p in ("g3d_customColor", "g3d_noSelect", "g3d_fullyOpaque", "g3d_glow", "teamcolor_alpha"):
+        if hasattr(bpy.types.Mesh, p):
+            try:
+                delattr(bpy.types.Mesh, p)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
