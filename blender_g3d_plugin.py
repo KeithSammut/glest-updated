@@ -161,9 +161,9 @@ def createMesh_import(filename, header, data, toblender, operator):
         bsdf = mat.node_tree.nodes.get("Principled BSDF") 
         tex_node = mat.node_tree.nodes.new("ShaderNodeTexImage") 
         tex_path = os.path.join(os.path.dirname(filename), header.diffusetexture)
-        try: 
+        try:
             tex_node.image = bpy.data.images.load(tex_path) 
-        except: 
+        except:
             print(f"Warning: Texture not found: {tex_path}") 
         mat.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
     
@@ -323,10 +323,9 @@ def G3DSaver(filepath, context, toglest, operator):
                 normals_all.extend(v.normal)
         else:
             # Export each shapekey as a frame
-            keys = [k for k in shapekeys.key_blocks]
-            if keys[0].name != "Basis":
-                keys.sort(key=lambda k: 0 if k.name == "Basis" else 1)
-
+            keys = [k for k in shapekeys.key_blocks if k.name != "Basis"]
+            frameCount = len(keys)
+            
             for key in keys:
                 for v in key.data:
                     vertices_all.extend(v.co)
@@ -550,7 +549,6 @@ classes = (
 )
 
 def G3DSaver(filepath, context, toglest, operator):
-
     print(f"\nExporting: {filepath}")
     depsgraph = context.evaluated_depsgraph_get()
 
@@ -558,7 +556,6 @@ def G3DSaver(filepath, context, toglest, operator):
     if not objs:
         objs = list(bpy.data.objects)
 
-    # Only mesh objects
     mesh_objs = [o for o in objs if o.type == 'MESH']
     if not mesh_objs:
         operator.report({'ERROR'}, "No mesh objects found to export")
@@ -570,12 +567,10 @@ def G3DSaver(filepath, context, toglest, operator):
         operator.report({'ERROR'}, f"Cannot open file for writing: {e}")
         return -1
 
-    # Write G3DHeader v4
+    # Write G3D header v4
     f.write(struct.pack("<3cB", b'G', b'3', b'D', 4))
-    # Write model header (meshCount, type=0)
-    f.write(struct.pack("<HB", len(mesh_objs), 0))
+    f.write(struct.pack("<HB", len(mesh_objs), 0))  # model header
 
-    # Helper function to get first image in material
     def find_image_in_material(mat):
         if mat is None:
             return None
@@ -586,24 +581,23 @@ def G3DSaver(filepath, context, toglest, operator):
         return None
 
     for obj in mesh_objs:
-        # Get evaluated mesh
         eval_obj = obj.evaluated_get(depsgraph)
         me = eval_obj.to_mesh()
         me.calc_loop_triangles()
         uv_layer = me.uv_layers.active.data if me.uv_layers.active else None
 
-        # Determine frames from shape keys
+        # --- Determine frames ---
         shapekeys = getattr(me, "shape_keys", None)
-        frameCount = 1
         if shapekeys and len(shapekeys.key_blocks) > 1:
-            frameCount = len(shapekeys.key_blocks)
             keys = list(shapekeys.key_blocks)
             if keys[0].name != "Basis":
                 keys.sort(key=lambda k: 0 if k.name == "Basis" else 1)
+            frameCount = len(keys)
         else:
-            keys = [None]  # single frame
+            keys = [None]
+            frameCount = 1
 
-        # Handle materials/textures
+        # --- Handle material & textures ---
         diffuseColor = (1.0, 1.0, 1.0)
         specularColor = (0.9, 0.9, 0.9)
         opacity = 1.0
@@ -616,20 +610,17 @@ def G3DSaver(filepath, context, toglest, operator):
             if img and getattr(img, "filepath", None):
                 textures_flag |= 1  # diffuse
                 texnames.append(os.path.basename(bpy.path.abspath(img.filepath)))
-                if hasattr(mat, "diffuse_color"):
-                    diffuseColor = mat.diffuse_color[:3]
-                if hasattr(mat, "specular_color"):
-                    specularColor = mat.specular_color[:3]
-                if hasattr(mat, "alpha"):
-                    opacity = mat.alpha
-            # Additional textures (spec/normal)
+                diffuseColor = mat.diffuse_color[:3] if hasattr(mat, "diffuse_color") else diffuseColor
+                specularColor = mat.specular_color[:3] if hasattr(mat, "specular_color") else specularColor
+                opacity = mat.alpha if hasattr(mat, "alpha") else opacity
+
             if mat.use_nodes and mat.node_tree:
-                images = [n.image for n in mat.node_tree.nodes if n.type=='TEX_IMAGE' and getattr(n, "image", None)]
+                images = [n.image for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and getattr(n, "image", None)]
                 for im in images[1:3]:
                     texnames.append(os.path.basename(bpy.path.abspath(im.filepath)))
                     textures_flag |= 1 << (len(texnames)-1)
 
-        # === Build UV-mapped vertex index map ===
+        # --- Build UV-mapped vertex index map ---
         vmap = {}
         base_vertices = []
         base_normals = []
@@ -659,7 +650,7 @@ def G3DSaver(filepath, context, toglest, operator):
         specularPower = 9.999999
         properties = 0
 
-        # === Frame vertex collection (for shapekeys) ===
+        # --- Collect vertices/normals for all frames ---
         vertices_all = []
         normals_all = []
 
@@ -674,7 +665,7 @@ def G3DSaver(filepath, context, toglest, operator):
                     vertices_all.extend([co.x, co.y, co.z])
                 normals_all.extend(base_normals)
 
-        # === Optional rotation to Glest orientation ===
+        # --- Optional rotation to Glest orientation ---
         if toglest and not obj.get("is_g3d", False):
             rot = Matrix((
                 (1, 0, 0, 0),
@@ -683,15 +674,13 @@ def G3DSaver(filepath, context, toglest, operator):
                 (0, 0, 0, 1)
             ))
             for i in range(0, len(vertices_all), 3):
-                v = Vector((vertices_all[i], vertices_all[i+1], vertices_all[i+2]))
-                v_rot = rot.to_3x3() @ v
-                vertices_all[i:i+3] = v_rot
+                v = Vector(vertices_all[i:i+3])
+                vertices_all[i:i+3] = rot.to_3x3() @ v
             for i in range(0, len(normals_all), 3):
-                n = Vector((normals_all[i], normals_all[i+1], normals_all[i+2]))
-                n_rot = rot.to_3x3() @ n
-                normals_all[i:i+3] = n_rot
+                n = Vector(normals_all[i:i+3])
+                normals_all[i:i+3] = rot.to_3x3() @ n
 
-        # === Custom G3D mesh properties ===
+        # --- Apply custom G3D properties ---
         mesh_data = obj.data
         if getattr(mesh_data, "g3d_customColor", False):
             properties |= 1
@@ -705,22 +694,22 @@ def G3DSaver(filepath, context, toglest, operator):
         if getattr(mesh_data, "g3d_fullyOpaque", False):
             opacity = 1.0
 
-        # === Write MeshHeader ===
+        # --- Write MeshHeader ---
         meshname_bytes = bytes(obj.name[:64], "ascii")
         f.write(struct.pack("<64s3I8f2I",
             meshname_bytes,
             frameCount, vertexCount, indexCount,
-            float(diffuseColor[0]), float(diffuseColor[1]), float(diffuseColor[2]),
-            float(specularColor[0]), float(specularColor[1]), float(specularColor[2]),
-            float(specularPower), float(opacity),
-            int(properties), int(textures_flag)
+            *diffuseColor,
+            *specularColor,
+            specularPower, opacity,
+            properties, textures_flag
         ))
 
-        # === Write texture names ===
+        # --- Write texture names ---
         for tn in texnames:
             f.write(struct.pack("<64s", bytes(tn[:64], "ascii")))
 
-        # === Write vertices, normals, UVs, indices ===
+        # --- Write vertices, normals, UVs, indices ---
         f.write(struct.pack("<%if" % (frameCount*vertexCount*3), *vertices_all))
         f.write(struct.pack("<%if" % (frameCount*vertexCount*3), *normals_all))
         if textures_flag:
@@ -732,6 +721,7 @@ def G3DSaver(filepath, context, toglest, operator):
     f.close()
     operator.report({'INFO'}, f"Exported {len(mesh_objs)} mesh(es) to {os.path.basename(filepath)}")
     return 0
+
 
 def register():
     # custom mesh properties
