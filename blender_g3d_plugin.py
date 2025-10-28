@@ -104,34 +104,32 @@ class G3DMeshdataV4:
             self.texturecoords = ()
         self.indices = struct.unpack(indices_format, fileID.read(struct.calcsize(indices_format)))
 
+###########################################################################
+# --- Import Implementation (kept light & modern) ---
+###########################################################################
 def createMesh_import(filename, header, data, toblender, operator):
+    # Basic import: create mesh with first (base) frame vertices and triangles
     mesh = bpy.data.meshes.new(header.meshname)
     meshobj = bpy.data.objects.new(header.meshname + "_Object", mesh)
     bpy.context.collection.objects.link(meshobj)
     bpy.context.view_layer.update()
 
-    # vertices and faces
+    # Build vertex list (use first frame)
     vertsCO = [(data.vertices[i], data.vertices[i+1], data.vertices[i+2])
                for i in range(0, header.vertexcount * 3, 3)]
     faces = [(data.indices[i], data.indices[i+1], data.indices[i+2])
              for i in range(0, len(data.indices), 3)]
+
     mesh.from_pydata(vertsCO, [], faces)
     mesh.update()
-
-    # --- UVs ---
-    if header.hastexture:
-        uv_layer = mesh.uv_layers.new(name="UVMap")
-        for i, loop in enumerate(mesh.loops):
-            vi = loop.vertex_index
-            uv_layer.data[i].uv = (
-                data.texturecoords[vi*2],
-                1 - data.texturecoords[vi*2 + 1]  # flip V axis if needed
-            )
-
-    # --- Shape keys ---
+    
     if header.framecount > 1:
+        # Ensure object has shape keys
         if meshobj.data.shape_keys is None:
+            # First add the Basis key
             meshobj.shape_key_add(name="Basis", from_mix=False)
+
+        # Add shapekeys for each frame after the first
         for f in range(1, header.framecount):
             sk = meshobj.shape_key_add(name=f"Frame_{f}", from_mix=False)
             for i in range(header.vertexcount):
@@ -142,12 +140,37 @@ def createMesh_import(filename, header, data, toblender, operator):
                     data.vertices[idx + 2]
                 )
 
+        # Optional: auto-key animation
+        for i in range(1, header.framecount):
+            shape = meshobj.data.shape_keys.key_blocks[i]
+            shape.value = 0.0
+            shape.keyframe_insert("value", frame=i)
+            shape.value = 1.0
+            shape.keyframe_insert("value", frame=i + 1)
+            shape.value = 0.0
+            shape.keyframe_insert("value", frame=i + 2)
+
+
     if toblender:
         meshobj.rotation_euler = (radians(90), 0, 0)
+        
+    meshobj["is_g3d"] = True 
+    if header.hastexture and header.diffusetexture: 
+        mat = bpy.data.materials.new(name=header.meshname + "_Mat") 
+        mat.use_nodes = True 
+        bsdf = mat.node_tree.nodes.get("Principled BSDF") 
+        tex_node = mat.node_tree.nodes.new("ShaderNodeTexImage") 
+        tex_path = os.path.join(os.path.dirname(filename), header.diffusetexture)
+        try: 
+            tex_node.image = bpy.data.images.load(tex_path) 
+        except: 
+            print(f"Warning: Texture not found: {tex_path}") 
+        mat.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
+    
+    meshobj.data.materials.append(mat)
 
     mesh.update()
     mesh.validate(clean_customdata=True)
-    meshobj["is_g3d"] = True
     return meshobj
 
 
